@@ -15,7 +15,7 @@ const upload = multer({ dest: 'uploads/' })
 app.use(cors())
 app.use(express.json())
 
-const chroma = new ChromaClient({ path: 'http://localhost:8000' })
+const chroma = new ChromaClient({ path: process.env.CHROMA_URL || 'http://localhost:8000' })
 let collection
 
 async function init() {
