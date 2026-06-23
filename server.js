@@ -6,7 +6,7 @@ const multer = require('multer')
 const Anthropic = require('@anthropic-ai/sdk')
 const fs = require('fs')
 const pdf = require('pdf-parse')
-const { ChromaClient } = require('chromadb')
+const { pipeline } = require('@xenova/transformers')
 
 const anthropic = new Anthropic()
 const app = express()
@@ -15,19 +15,37 @@ const upload = multer({ dest: 'uploads/' })
 app.use(cors())
 app.use(express.json())
 
-const chroma = new ChromaClient({ path: process.env.CHROMA_URL || 'http://localhost:8000' })
-let collection
+const vectorStore = []
 
+let extractor
 async function init() {
-    const { DefaultEmbeddingFunction } = await import('@chroma-core/default-embed')
-    const embedder = new DefaultEmbeddingFunction()
-    collection = await chroma.getOrCreateCollection({
-        name: 'knowledge',
-        embeddingFunction: embedder
-    })
-    console.log('ChromaDB collection ready')
+    extractor = await pipeline('feature-extraction', 'Xenova/all-MiniLM-L6-v2')
+    console.log('Embedding model ready')
 }
-init().catch(err => console.error('ChromaDB init failed:', err.message))
+init()
+
+async function getEmbedding(text) {
+    const output = await extractor(text, { pooling: 'mean', normalize: true })
+    return Array.from(output.data)
+}
+
+function cosineSimilarity(a, b) {
+    let dot = 0, normA = 0, normB = 0
+    for (let i = 0; i < a.length; i++) {
+        dot   += a[i] * b[i]
+        normA += a[i] * a[i]
+        normB += b[i] * b[i]
+    }
+    return dot / (Math.sqrt(normA) * Math.sqrt(normB))
+}
+
+function queryStore(queryVector, nResults = 3) {
+    return vectorStore
+        .map(entry => ({ ...entry, score: cosineSimilarity(queryVector, entry.embedding) }))
+        .sort((a, b) => b.score - a.score)
+        .slice(0, nResults)
+        .map(entry => entry.document)
+}
 
 app.get('/', (req, res) => res.send('Backend is working'))
 
@@ -44,10 +62,15 @@ app.post('/upload', upload.single('file'), async (req, res) => {
             .map(c => c.trim())
             .filter(c => c.length > 50)
 
-        const ids = chunks.map((_, i) => `${req.file.originalname}-${Date.now()}-${i}`)
-        const metadatas = chunks.map(() => ({ source: req.file.originalname }))
-
-        await collection.add({ ids, documents: chunks, metadatas })
+        for (let i = 0; i < chunks.length; i++) {
+            const embedding = await getEmbedding(chunks[i])
+            vectorStore.push({
+                id: `${req.file.originalname}-${Date.now()}-${i}`,
+                embedding,
+                document: chunks[i],
+                source: req.file.originalname
+            })
+        }
 
         res.json({ message: `Indexed ${chunks.length} chunks from "${req.file.originalname}"` })
     } catch (err) {
@@ -61,8 +84,9 @@ app.post('/chat', async (req, res) => {
     if (!question) return res.status(400).send('No question provided')
 
     try {
-        const results = await collection.query({ queryTexts: [question], nResults: 3 })
-        const context = results.documents[0].join('\n\n')
+        const questionVector = await getEmbedding(question)
+        const topChunks = queryStore(questionVector, 3)
+        const context = topChunks.join('\n\n')
 
         const response = await anthropic.messages.create({
             model: 'claude-opus-4-8',
